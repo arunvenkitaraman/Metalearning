@@ -1,0 +1,795 @@
+# Arun Venkitaraman 17Nov20
+import math
+import random
+import time
+import copy
+import torch  # v0.4.1
+from torch import nn
+from torch.nn import functional as F
+import matplotlib as mpl
+import datetime
+import dill
+from torch import autograd
+
+import numpy as np
+import scipy.io as sio
+from scipy.sparse import csc_matrix
+from numpy.linalg import norm
+from sklearn.model_selection import train_test_split
+from copy import deepcopy
+import scipy as sp
+import pickle
+from sklearn.preprocessing import normalize
+from operator import itemgetter
+import os
+
+#cuda = torch.device('cuda')
+#temp['X'][0]=temp['X'][0].float()
+
+import gc 
+gc.collect()
+
+mpl.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+#use_cuda=True
+nh =8 # no of neurons
+kshot=4 # no fo shots or samples in each task
+n_meta_train = 50000
+n_tasks = 20 # no of training task
+n_tasks_test= 20  # no of test tasks
+reg =.001  # regularization 'mu' for gaussin kernel
+reg_cos=.001  # regularization 'mu' for cosine kernel
+sigma = 1
+nx=1 # input dimension
+nx=w*w
+n_o=5
+
+alpha = 1e-3  # MAML grad step size
+lr_maml=1e-3  #
+lr_krmaml=1e-3  # Learning rate (LR) for Gaussian
+lr_krmaml_cos=1e-3 # Learning rate for Cosine
+lr_W=1e-4 # LR for regression coefficients for Gaussian kernel
+lr_W_cos=1e-4 # LR for cosine
+
+test_step=500
+
+# comparing two kernels here
+kernel_1 = 'gaussian'
+kernel_2 = 'cosine'
+fig_id='_21cuda_11'
+varying_amp=1
+   # If 1 the amplitudes of task sinusoids vary, freq fixed
+   # If 0, amp fixed, freq varies
+
+
+n_rff=100
+
+filename = 'global_' + fig_id+ '.pkl' #to save parameters
+cmap = plt.get_cmap('jet')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+
+def net(x, params):
+    x = F.linear(x, params[0], params[1])
+    x = F.relu(x)
+
+    #%x = F.linear(x, params[2], params[3])
+    #x = F.relu(x)
+
+    x = F.linear(x, params[2], params[3])
+    x = F.relu(x)
+
+    x = F.linear(x, params[4], params[5])
+    return x
+
+
+def kernel_product(w, x, mode="gaussian", s=0.1):
+    w_i = w.unsqueeze(0)
+    x_j = x.unsqueeze(0)
+    xmy = ((w_i - x_j) ** 2).sum()
+    # st()
+    if mode == "gaussian":
+        K = torch.exp(- (torch.t(xmy) ** 2) / (s ** 2))
+    elif mode == "cosine":
+        K = torch.dot(w, x) / (1e-7 + torch.norm(w, p=2) * torch.norm(x, p=2))
+    elif mode == "laplace":
+        K = torch.exp(- torch.sqrt(torch.t(xmy) + (s ** 2)))
+    elif mode == "energy":
+        K = torch.pow(torch.t(xmy) + (s ** 2), -.25)
+
+    return K
+
+def kernel_product_rff(w, x, mode="gaussian", s=0.1):
+    w_i = w.unsqueeze(0)
+    x_j = x.unsqueeze(0)
+    xmy = ((w_i - x_j) ** 2).sum()
+    
+
+    # st()
+    if mode == "gaussian":
+        K = torch.exp(- (torch.t(xmy) ** 2) / (s ** 2))
+    elif mode == "cosine":
+        K = torch.dot(w, x) / (1e-7 + torch.norm(w, p=2) * torch.norm(x, p=2))
+    elif mode == "laplace":
+        K = torch.exp(- torch.sqrt(torch.t(xmy) + (s ** 2)))
+    elif mode == "energy":
+        K = torch.pow(torch.t(xmy) + (s ** 2), -.25)
+
+    return K 
+
+# square distance computation
+def dist(x,y):
+    n = x.size(0)
+    m = y.size(0)
+    d = x.size(1)
+
+    x = x.unsqueeze(1).expand(n, m, d)
+    y = y.unsqueeze(0).expand(n, m, d)
+    dist = torch.pow(x - y, 2).sum(2) 
+    return dist
+
+#Cosine distance matrix
+def cos_dist(a, b, eps=1e-8):
+    """
+    added eps for numerical stability
+    """
+    a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
+    a_norm = a /(a_n+ eps * torch.ones_like(a_n))
+    b_norm = b / (b_n+ eps * torch.ones_like(b_n))
+    sim_mt = torch.mm(a_norm, b_norm.t())
+    return sim_mt
+
+params_maml = [
+    torch.cuda.FloatTensor(nh, nx).uniform_(-1/math.sqrt(nh), 1/math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    #torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    #torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(n_o, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(n_o).zero_().requires_grad_(),
+
+]
+
+
+params_krmaml = [
+    torch.cuda.FloatTensor(nh, nx).uniform_(-1/math.sqrt(nh), 1/math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    #torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    #torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(n_o, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(n_o).zero_().requires_grad_(),
+]
+
+params_krmaml_cos = [
+    torch.cuda.FloatTensor(nh, nx).uniform_(-1/math.sqrt(nh), 1/math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    #torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    #torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(n_o, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(n_o).zero_().requires_grad_(),
+]
+
+n_inner_loop=1
+
+params_metasgd = [
+    torch.cuda.FloatTensor(nh, nx).uniform_(-1/math.sqrt(nh), 1/math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    #torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    #torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(nh, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(nh).zero_().requires_grad_(),
+
+    torch.cuda.FloatTensor(n_o, nh).uniform_(-1. / math.sqrt(nh), 1. / math.sqrt(nh)).requires_grad_(),
+    torch.cuda.FloatTensor(n_o).zero_().requires_grad_(),
+]
+
+# Learning rate for Meta-SGD
+alp_metasgd = [
+    torch.cuda.FloatTensor(nh, nx).uniform_(1e-3, 1e-2).requires_grad_(),
+    torch.cuda.FloatTensor(nh).uniform_(1e-3, 1e-2).requires_grad_(),
+
+    #torch.cuda.FloatTensor(nh, nh).uniform_(1e-3, 1e-2).requires_grad_(),
+    #torch.cuda.FloatTensor(nh).uniform_(1e-3, 1e-2).requires_grad_(),
+
+    torch.cuda.FloatTensor(nh, nh).uniform_(1e-3, 1e-2).requires_grad_(),
+    torch.cuda.FloatTensor(nh).uniform_(1e-3, 1e-2).requires_grad_(),
+
+    torch.cuda.FloatTensor(n_o, nh).uniform_(1e-3, 1e-2).requires_grad_(),
+    torch.cuda.FloatTensor(n_o).uniform_(1e-3, 1e-2).requires_grad_(),
+
+]
+
+
+mse_loss = nn.MSELoss(reduction='mean')
+
+# kernel regression coefficients for TANML: W is the same as Psi in the paper
+# Gaussian kernel
+W_krmaml = []
+for i in range(len(params_krmaml)):
+    s = len(params_krmaml[i].view(-1))
+    W_krmaml.append((torch.cuda.FloatTensor(s, n_tasks).uniform_(-1./(s*n_tasks),1./(s*n_tasks)).requires_grad_()))
+
+
+#Cosine kernel
+W_krmaml_cos = []
+for i in range(len(params_krmaml)):
+    s = len(params_krmaml_cos[i].view(-1))
+    W_krmaml_cos.append((torch.cuda.FloatTensor(s, n_tasks).uniform_(-1./(s*n_tasks),1./(s*n_tasks)).requires_grad_()))
+   
+
+#MAML Meta train
+
+def maml(x, y, n_meta_train, params, alpha, c):
+
+    
+    plt.clf()
+    colors = cmap(np.linspace(0, 1, (n_tasks)))
+    for it in range(n_meta_train):
+
+        new_params = params
+        # print(new_params[0][0:10])
+        loss_full = 0
+        loss2_full = 0
+        
+        for k in range(n_inner_loop):
+            t_e = 0
+            for tasks in range(n_tasks):
+                color=colors[tasks]
+                new_params = params
+                #tempx = x[tasks]
+                # print(tempx)
+                #tempy = y[tasks]
+                f = net(x[tasks], new_params)
+                #loss = mse_loss(f, y[tasks])
+                loss = F.cross_entropy(f, y[tasks])
+                if torch.isnan(loss)==True: print(tasks)
+              
+                loss_full = loss_full + loss
+                # create_graph=True because computing grads here is part of the forward pass.
+                # We want to differentiate through the SGD update steps and get higher order
+                # derivatives in the backward pass.
+                grads = torch.autograd.grad(loss, new_params)
+                #print(grads)
+                new_params = [(params[i] - alpha * grads[i]) for i in range(len(params))]
+
+                
+                v_tempf = net(v_x[tasks], new_params)
+                #loss2 = mse_loss(v_tempf, v_y[tasks])
+                loss2 = F.cross_entropy(v_tempf, v_y[tasks])
+                loss2_full = loss2_full + loss2
+                
+                t_e = t_e + torch.norm(v_y[tasks].type(torch.cuda.FloatTensor), p=2)**2/len(v_y[tasks])
+
+        loss_tr = loss2_full
+
+
+        dis = 10 * torch.log10(loss_tr / t_e)
+        nmse_train=dis.clone().detach()
+        if c % 50 == 0: print('MAML train Iteration %d -- Outer Loss: %.4f' % (c, dis))
+    #     # print(*alpha,sep=',')
+    del loss, loss2, loss_full, loss_tr, new_params, dis, v_tempf
+    torch.cuda.empty_cache()
+    return params, nmse_train, loss2_full, (c + 1)
+
+#Meta-SGD Meta train
+
+def metasgd(x, y, n_meta_train, params, alp_metasgd, c):
+
+    
+    plt.clf()
+    colors = cmap(np.linspace(0, 1, (n_tasks)))
+    for it in range(n_meta_train):
+
+        new_params = params
+        # print(new_params[0][0:10])
+        loss_full = 0
+        loss2_full = 0
+        
+        for k in range(n_inner_loop):
+            t_e = 0
+            for tasks in range(n_tasks):
+                color=colors[tasks]
+                new_params = params
+                #tempx = x[tasks]
+                # print(tempx)
+                #tempy = y[tasks]
+                f = net(x[tasks], new_params)
+                #loss = mse_loss(f, y[tasks])
+                loss = F.cross_entropy(f, y[tasks])
+                loss_full = loss_full + loss
+                # create_graph=True because computing grads here is part of the forward pass.
+                # We want to differentiate through the SGD update steps and get higher order
+                # derivatives in the backward pass.
+                grads = torch.autograd.grad(loss, new_params)
+                
+                new_params = [(params[i] - alp_metasgd[i]*grads[i]) for i in range(len(params))]
+                #print(grads)
+
+                v_tempf = net(v_x[tasks], new_params)
+                #loss2 = mse_loss(v_tempf, v_y[tasks])/n_tasks
+                loss2 = F.cross_entropy(v_tempf, v_y[tasks])
+                loss2_full = loss2_full + loss2
+                #print('Loss2:',loss2)
+                t_e = t_e + torch.norm(v_y[tasks].type(torch.cuda.FloatTensor), p=2)**2/len(v_y[tasks])
+
+                
+        loss_tr = loss2_full
+
+
+        dis = 10 * torch.log10(loss_tr / t_e)
+        nmse_train=dis.clone().detach()
+        if c % 50 == 0: print('MetaSGD train Iteration %d -- Outer Loss: %.4f' % (c, dis))
+    #     # print(*alpha,sep=',')
+    del loss, loss2, loss_full, loss_tr, new_params, dis, v_tempf
+    torch.cuda.empty_cache()
+    return params, alp_metasgd, nmse_train, loss2_full, (c + 1)
+
+
+## TANML (My method): Meta Trainng
+def krmaml(x, y, n_meta_train, W, params, c,kernel,reg):
+  
+    plt.clf()
+    colors = cmap(np.linspace(0, 1, (n_tasks)))
+    for it in range(n_meta_train):
+        new_params = params
+     
+        loss_full = 0
+      
+        Z_param_train = []
+        new_params = params
+        with torch.no_grad(): grads=[(params) for i in range(n_tasks)]
+        K = torch.cuda.FloatTensor(len(params), n_tasks, n_tasks).zero_()
+        for tasks in range(n_tasks):
+            color=colors[tasks]
+            
+            f = net(x[tasks], new_params)
+            #print(f)
+            #loss = mse_loss(f, y[tasks])
+            loss = F.cross_entropy(f, y[tasks])
+            loss_full = loss_full + loss
+            grads[tasks] = torch.autograd.grad(loss, new_params)
+             
+        for i in range(len(params)):
+
+            Z = []
+            for tasks in range(n_tasks):
+         
+            
+                z = torch.stack([new_params[i], (grads[tasks][i])]).view(-1) # almost twice slower than MAML
+               # z = torch.stack([(grads[tasks][i])]).view(-1) # similarly fast as MAML but performs worse than the other
+                
+                #z.requires_grad_()
+                Z.append(z)
+            Z=torch.stack(Z)
+            #print(Z)
+
+            Z_param_train.append(Z)
+
+            # Z.requires_grad_()
+
+            
+            if kernel=="cosine": K[i, :,:] = cos_dist(Z,Z)
+            elif kernel == "gaussian": K[i, :,:] =torch.exp(-dist(Z,Z)/(sigma**2))
+        #print(K)
+
+        loss2_full = 0
+        t_e = 0
+        for tasks in range(n_tasks):
+            color=colors[tasks]
+            new_params_vec = [(torch.matmul(W[i], K[i, :, tasks])) for i in range(len(params))]
+            # with torch.no_grad():
+            new_params_t = [(new_params_vec[i].reshape(params[i].size())) for i in range(len(params))]
+            
+            v_tempf = net(v_x[tasks], new_params_t)
+            #print(v_tempf)
+           
+            #loss2 = mse_loss(net(v_x[tasks], new_params_t), v_y[tasks])/n_tasks
+            loss2 = F.cross_entropy(net(v_x[tasks], new_params_t), v_y[tasks])
+            loss2_full = loss2_full + loss2
+            #print('Loss2:',loss2)
+            t_e = t_e + torch.norm(v_y[tasks].type(torch.cuda.FloatTensor), p=2)**2/len(v_y[tasks])
+           
+        loss_tr = loss2_full
+        loss_W = torch.cuda.FloatTensor(1).zero_()
+        for i in range(len(W)):
+            loss_W = loss_W + reg * torch.trace(torch.matmul(W[i],torch.matmul(K[i,:,:],W[i].t())))
+        loss2_full = loss2_full + loss_W
+
+        dis = 10 * torch.log10(loss_tr / t_e)
+        nmse_train=dis.clone().detach()
+        if c % 50 == 0: print('KRMAML train Iteration %d -- Outer Loss: %.4f' % (c, dis))
+     
+    del loss, loss2, loss_full, loss_W, loss_tr, new_params, new_params_vec, z, dis, v_tempf
+    torch.cuda.empty_cache()
+    return params, nmse_train, Z_param_train, K, loss2_full, (c + 1)
+
+######## TEST
+# MAML
+def maml_test(t_x_, t_y_, v_x_, v_y_, params, n_tasks_test, A_):
+    t_params = params
+    loss_full = torch.cuda.FloatTensor(1).zero_()
+    t_loss = torch.cuda.FloatTensor(1).zero_()
+    t_e = torch.cuda.FloatTensor(1).zero_()
+    cmap = plt.get_cmap('jet')
+    colors = cmap(np.linspace(0.1, .9, (n_tasks_test)))
+    plt.clf()
+    for tasks in range(n_tasks_test):
+        color = colors[tasks]
+
+        t_params = params
+       
+        f = net(t_x_[tasks], t_params)
+        #loss = mse_loss(f, t_y_[tasks])
+        loss = F.cross_entropy(f, t_y_[tasks])
+
+        loss_full = loss_full + loss
+        grads = torch.autograd.grad(loss, t_params, create_graph=False)
+        new_params = [(params[i] - alpha * grads[i]) for i in range(len(params))]
+
+
+        v_tempf = net(v_x_[tasks], t_params)
+        #loss2 = mse_loss(v_tempf, v_y_[tasks])
+        loss2 = F.cross_entropy(v_tempf, v_y_[tasks])
+        t_loss = t_loss + loss2
+        t_e = t_e + torch.norm(v_y_[tasks].type(torch.cuda.FloatTensor), p=2)**2/len(v_y_[tasks])
+
+        
+        dis = 10*torch.log10((t_loss / t_e))
+        # nmse_test.append(dis)
+        nmse_test=dis.clone().detach()
+    # print('MAML Test Loss: %.4f' % (dis))
+    del loss, loss2, t_loss, t_params, new_params, dis, v_tempf
+    torch.cuda.empty_cache()
+    return params, nmse_test
+
+# TANML (My)
+def krmaml_test(t_x_, t_y_, v_x_, v_y_, params, n_tasks_test, W, Z_param_train, A_,kernel):
+    cmap = plt.get_cmap('jet')
+    colors = cmap(np.linspace(0.1, .9, (n_tasks_test)))
+    
+    # K.requires_grad_()
+    new_params = params
+    loss_full = torch.cuda.FloatTensor(1).zero_()
+      
+    Z_test = []
+    new_params = params
+    with torch.no_grad(): grads=[(params) for i in range(n_tasks_test)]
+    K_test = torch.cuda.FloatTensor(len(params), n_tasks, n_tasks_test).zero_()
+    for tasks in range(n_tasks_test):
+        color=colors[tasks]
+        
+        f = net(t_x_[tasks], new_params)
+        #print(f)
+        #loss = mse_loss(f, t_y_[tasks])
+        loss = F.cross_entropy(f, t_y_[tasks])
+        loss_full = loss_full + loss
+        grads[tasks] = torch.autograd.grad(loss, new_params, create_graph=False)
+                
+        for i in range(len(params)):
+            Z = Z_param_train[i]
+            Z_test = []
+            for tasks in range(n_tasks_test):
+         
+            
+                with torch.no_grad():z_test = torch.stack([new_params[i], (grads[tasks][i])]).view(-1)
+                #with torch.no_grad():z_test = torch.stack([(grads[tasks][i])]).view(-1)
+                
+                #z_test.requires_grad_()
+                with torch.no_grad():Z_test.append(z_test)
+            with torch.no_grad():Z_test=torch.stack(Z_test)
+            #print(Z)
+
+            
+
+            
+           
+            with torch.no_grad():
+              if kernel=="cosine": K_test[i, :,:] = cos_dist(Z,Z_test)
+              elif kernel=="g_rff": K_test[i, :,:] = dist_rff(Z,Z_test,Omega[i])
+              elif kernel == "gaussian": K_test[i, :,:]=torch.exp(-dist(Z,Z_test)/(sigma**2))
+                    # print(K)    
+   
+    with torch.no_grad():t_loss = torch.cuda.FloatTensor(1).zero_()
+    with torch.no_grad():t_e = torch.cuda.FloatTensor(1).zero_()
+
+    colors = cmap(np.linspace(0.1, .9, (n_tasks_test)))
+    for tasks in range(n_tasks_test):
+        color = colors[tasks]
+
+        with torch.no_grad():new_params_vec = [(torch.matmul(W[i], K_test[i, :, tasks])) for i in range(len(params))]
+        # with torch.no_grad():
+        with torch.no_grad():new_params = [(new_params_vec[i].reshape(params[i].size())) for i in range(len(params))]
+
+        #v_tempx = v_x[tasks]
+        #v_tempy = v_y[tasks]
+        with torch.no_grad():v_tempf = net(v_x_[tasks], new_params)
+        with torch.no_grad(): loss2 = F.cross_entropy(v_tempf, v_y_[tasks])#loss2 = mse_loss(v_tempf, v_y_[tasks])
+        with torch.no_grad():t_loss = t_loss + loss2
+        with torch.no_grad():t_e = t_e + torch.norm(v_y_[tasks].type(torch.cuda.FloatTensor), p=2)**2/len(v_y_[tasks])
+
+        with torch.no_grad():dis = 10*torch.log10((t_loss / t_e))
+        #nmse_test = dis.item()
+        with torch.no_grad():nmse_test=dis.clone().detach()
+  
+    del loss, loss2, t_loss, Z, new_params, new_params_vec, dis, Z_test, z_test, v_tempf
+    torch.cuda.empty_cache()
+    return params, nmse_test, K_test
+
+# Meta-SGD
+def metasgd_test(t_x_, t_y_, v_x_, v_y_, params, n_tasks_test, A_):
+    t_params = params
+    loss_full = torch.cuda.FloatTensor(1).zero_()
+    t_loss = torch.cuda.FloatTensor(1).zero_()
+    t_e = torch.cuda.FloatTensor(1).zero_()
+    cmap = plt.get_cmap('jet')
+    colors = cmap(np.linspace(0.1, .9, (n_tasks_test)))
+    plt.clf()
+    for tasks in range(n_tasks_test):
+        color = colors[tasks]
+
+        t_params = params
+        
+        f = net(t_x_[tasks], t_params)
+        #loss = mse_loss(f, t_y_[tasks])
+        loss = F.cross_entropy(f, t_y_[tasks])
+        loss_full = loss_full + loss
+        grads = torch.autograd.grad(loss, t_params)
+        new_params = [(params[i] - alp_metasgd[i] * grads[i]) for i in range(len(params))]
+
+        v_tempf = net(v_x_[tasks], new_params)
+        #loss2 = mse_loss(v_tempf, v_y_[tasks])
+        loss2 = F.cross_entropy(v_tempf, v_y_[tasks])
+        t_loss = t_loss + loss2
+        t_e = t_e + torch.norm(v_y_[tasks].type(torch.cuda.FloatTensor), p=2)**2/len(v_y_[tasks])
+
+        
+        dis = 10*torch.log10((t_loss / t_e))
+        # nmse_test.append(dis)
+        nmse_test=dis.clone().detach()
+    # print('MAML Test Loss: %.4f' % (dis))
+    del loss, loss2, t_loss, t_params, new_params, dis, v_tempf
+    torch.cuda.empty_cache()
+    return params, alp_metasgd,nmse_test
+
+
+######## Main
+x = []
+y = []
+v_x = []
+v_y = []
+t = time.time()
+A = []
+nmse_train = []
+loss2_full_maml = torch.cuda.FloatTensor(1).zero_()
+loss2_full_krmaml = torch.cuda.FloatTensor(1).zero_()
+
+# Generating training and testing sinusoids
+#all_features = temp['X'][0]
+#all_labels = temp['Y'][0]
+#shuffled_task_indexes = np.random.permutation(len(all_features))
+#all_features = [all_features[shuffled_task_indexes[i]].T for i in range(len(all_features))]
+#all_labels = [all_labels[shuffled_task_indexes[i]] for i in range(len(all_labels))]
+
+
+A_ = []
+#shuffled_task_indexes = np.random.permutation(100)
+#all_features=all_features[shuffled_task_indexes]
+#all_labels=all_labels[shuffled_task_indexes]
+
+x=torch.zeros(n_tasks,5,4096)
+y=torch.zeros(n_tasks,5).type(torch.LongTensor)
+v_x=torch.zeros(n_tasks,5,4096)
+v_y=torch.zeros(n_tasks,5).type(torch.LongTensor)
+for i in range(n_tasks):
+    x_spt, y_spt, x_qry, y_qry = db.next('train')
+
+
+        # [b, setsz, h, w, c] => [b, setsz, c, w, h] => [b, setsz, 3c, w, h]
+    for j in range(5):
+        x[i][j]=torch.from_numpy(x_spt[i][j]).view(-1)
+        v_x[i][j] = torch.from_numpy(x_qry[i][j]).view(-1)
+        y[i] = torch.from_numpy(y_spt[i]).view(-1).type(torch.LongTensor)
+        v_y[i] = torch.from_numpy(y_qry[i]).view(-1).type(torch.LongTensor)
+
+t_x_=torch.zeros(n_tasks,5,4096)
+t_y_=torch.zeros(n_tasks,5).type(torch.LongTensor)
+v_x_=torch.zeros(n_tasks,5,4096)
+v_y_=torch.zeros(n_tasks,5).type(torch.LongTensor)
+for i in range(n_tasks):
+    x_spt, y_spt, x_qry, y_qry = db.next('train')
+
+
+        # [b, setsz, h, w, c] => [b, setsz, c, w, h] => [b, setsz, 3c, w, h]
+    for j in range(5):
+        t_x_[i][j]=torch.from_numpy(x_spt[i][j]).view(-1)
+        v_x_[i][j] = torch.from_numpy(x_qry[i][j]).view(-1)
+        t_y_[i] = torch.from_numpy(y_spt[i]).view(-1).type(torch.LongTensor)
+        v_y_[i] = torch.from_numpy(y_qry[i]).view(-1).type(torch.LongTensor)
+#Test tasks
+
+
+
+    
+    #t_x_=
+  
+"""
+#x=torch.float(x)
+y=torch.float(y)
+v_x=v_x.float()
+v_y=v_y.float()
+v_x_=v_x_.float()
+v_y_=v_y_.float()
+t_x_=t_x_.float()
+t_y_=t_x_.float()
+"""
+
+NMSE_train_maml = []
+NMSE_train_krmaml = []
+NMSE_train_krmaml_cos = []
+NMSE_test_maml = []
+NMSE_test_krmaml = []
+NMSE_test_krmaml_cos = []
+test_axis_x=[]
+
+NMSE_train_maml = []
+NMSE_train_krmaml = []
+NMSE_train_krmaml_cos = []
+NMSE_test_maml = []
+NMSE_test_krmaml = []
+NMSE_test_krmaml_cos = []
+test_axis_x=[]
+
+NMSE_train_metasgd=[]
+NMSE_test_metasgd=[]
+
+# defining optimizers
+opt_metasgd = torch.optim.Adam([
+    {'params': params_metasgd, },
+    {'params': alp_metasgd, 'lr': 1e-5}
+], lr=lr_maml)
+loss2_full_metasgd = torch.cuda.FloatTensor(1).zero_()
+
+opt_maml = torch.optim.Adam(params_maml, lr=lr_maml)
+opt_krmaml = torch.optim.Adam([
+    {'params': params_krmaml, },
+    {'params': W_krmaml, 'lr': lr_W}
+], lr=lr_krmaml)
+opt_krmaml_cos = torch.optim.Adam([
+    {'params': params_krmaml_cos, },
+    {'params': W_krmaml_cos, 'lr': lr_W_cos}
+], lr=lr_krmaml_cos)
+
+
+#if device == torch.device('cuda'):
+#    torch.cuda.synchronize(device=device)
+#t1=time.time() 
+for tstep in range(n_meta_train):
+    print('Tr_Step:', tstep)
+    
+    opt_maml.zero_grad()
+    opt_krmaml.zero_grad()
+    opt_krmaml_cos.zero_grad()
+    
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t1=time.time()
+    [params_krmaml, nmse_train_krmaml, Z_param_train, K, loss2_full_krmaml, c] = krmaml(x, y, 1, W_krmaml,
+                                                                                         params_krmaml, 
+                                                                                         tstep,kernel_1,reg)
+    #
+    loss2_full_krmaml.backward()
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t2=time.time()
+    #print('kr1 time:',(t2-t1))
+    opt_krmaml.step()
+
+    
+
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t1=time.time()
+    [params_krmaml_cos, nmse_train_krmaml_cos, Z_param_train_cos, K_cos, loss2_full_krmaml_cos, c] = krmaml(x, y, 1, W_krmaml_cos,
+                                                                                         params_krmaml_cos, 
+                                                                                         tstep,kernel_2,reg_cos)
+    #
+    loss2_full_krmaml_cos.backward()
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t2=time.time()
+
+    opt_krmaml_cos.step()
+
+    
+    #print('kr2 time:',(t2-t1))
+    
+   
+    NMSE_train_krmaml.append(nmse_train_krmaml)
+    NMSE_train_krmaml_cos.append(nmse_train_krmaml_cos)
+
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t1=time.time()
+    [params_maml, nmse_train_maml, loss2_full_maml, c] = maml(x, y, 1, params_maml, alpha, tstep)
+ 
+    loss2_full_maml.backward()
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t2=time.time()
+    #print('maml time:',(t2-t1))
+    opt_maml.step()
+    NMSE_train_maml.append(nmse_train_maml)
+
+
+    opt_metasgd.zero_grad()
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t1=time.time()
+    [params_metasgd, alp_metasgd, nmse_train_metasgd, loss2_full_metasgd, c] = metasgd(x, y, 1, params_metasgd, alp_metasgd, tstep)
+    loss2_full_metasgd.backward()
+    #if device == torch.device('cuda'): torch.cuda.synchronize(device=device) 
+    #t2=time.time()
+    #print('metasgd time:',(t2-t1))
+    NMSE_train_metasgd.append(nmse_train_metasgd)
+    opt_metasgd.step()
+
+    
+   
+    # On every t_step iterations, compute the TEST loss and
+    # plot the TRAIN and TEST loss
+    if tstep % test_step== 0:
+      plt.clf()
+      plt.plot(NMSE_train_maml, label='maml')
+      plt.plot(NMSE_train_krmaml, label='krmaml-gaussian')
+      plt.plot(NMSE_train_krmaml_cos, label='krmaml-cosine')
+      plt.plot(NMSE_train_metasgd, label='metasgd')
+      plt.legend()
+    
+      plt.legend()
+      fig_name='/content/drive/My Drive/Colab Notebooks/omniglot/train_nmse_'+'BUN'+fig_id+'.jpg'
+      plt.savefig(fig_name)  
+
+    
+     
+      [params_krmaml, nmse_test_krmaml_, K_test_] = krmaml_test(t_x_, t_y_, v_x_, v_y_, params_krmaml, n_tasks_test, W_krmaml, Z_param_train, A_,kernel_1)
+      [params_krmaml_cos, nmse_test_krmaml_cos, K_test_cos] = krmaml_test(t_x_, t_y_, v_x_, v_y_, params_krmaml_cos, n_tasks_test, W_krmaml_cos, Z_param_train_cos, A_,kernel_2)
+      [params_maml, nmse_test_maml_] = maml_test(t_x_, t_y_, v_x_, v_y_, params_maml, n_tasks_test, A_)
+      [params_metasgd,alp_metasgd, nmse_test_metasgd_] = metasgd_test(t_x_, t_y_, v_x_, v_y_, params_metasgd, n_tasks_test, A_)
+      
+      NMSE_test_metasgd.append(nmse_test_metasgd_)
+      NMSE_test_maml.append(nmse_test_maml_)
+      NMSE_test_krmaml.append(nmse_test_krmaml_)
+      NMSE_test_krmaml_cos.append(nmse_test_krmaml_cos)
+
+      test_axis_x.append(tstep)
+      plt.clf()
+      plt.plot(test_axis_x,NMSE_test_maml, label='maml')
+      plt.plot(test_axis_x,NMSE_test_krmaml,label='krmaml-gaussian')
+      plt.plot(test_axis_x,NMSE_test_krmaml_cos,label='krmaml-cosine')
+      plt.plot(test_axis_x,NMSE_test_metasgd,label='metasgd')
+      
+      plt.legend()
+      fig_name='/content/drive/My Drive/Colab Notebooks/omniglot/test_nmse_'+'BUN'+fig_id+'.jpg'
+      plt.savefig(fig_name)
+      #t2=time.time()  
+      #if device == torch.device('cuda'):
+      #  torch.cuda.synchronize(device=device)
+      #t2=time.time() 
+      #print('device time:',(t2-t1))
+      filepath='/content/drive/My Drive/Colab Notebooks/omniglot/params'+'BUN'+fig_id+'.pkl'
+      dill.dump_session(filepath) # Saves session with all variables
+      #print('Epoch time:',(t2-t1))
+      #t1=t2
+    #torch.cuda.empty_cache()
+      
+     
